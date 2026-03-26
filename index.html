@@ -1872,10 +1872,7 @@ async function deleteWineFromDb(id) {
   await deleteDoc(doc(db, 'wines', String(id)));
 }
 
-// legacy sync save — also pushes to Firestore
-function save() {
-  // no-op: each mutation calls saveWineToDb directly
-}
+function save() { /* no-op: Firestore handles persistence */ }
 
 // ────────── TYPE LABELS
 const typeLabel = { red:'레드 Red', white:'화이트 White', rose:'로제 Rosé', sparkling:'스파클링 Sparkling' };
@@ -2735,20 +2732,25 @@ function saveWine() {
   };
   if (editingId) {
     const idx = wines.findIndex(w=>w.id===editingId);
-    wines[idx] = { ...wines[idx], ...wine };
+    const updated = { ...wines[idx], ...wine };
+    wines[idx] = updated;
+    saveWineToDb(updated);
   } else {
-    wine.id = nextId++;
-    wines.unshift(wine);
+    const ts = Date.now();
+    wine.id = ts;          // timestamp = unique id, no collision ever
+    wine._createdAt = ts;
+    saveWineToDb(wine);
   }
-  save(); closeModal(); renderList();
+  closeModal();
 }
 
 function deleteWine() {
   if (!editingId) return;
   if (!confirm('이 와인 기록을 삭제할까요?')) return;
   const deletedId = editingId;
-  wines = wines.filter(w=>w.id!==deletedId);
-  deleteWineFromDb(deletedId); closeModal(); renderList();
+  wines = wines.filter(w => w.id !== deletedId);
+  deleteWineFromDb(deletedId);
+  closeModal();
 }
 
 // Allow pasting image directly anywhere in the modal
@@ -2797,7 +2799,10 @@ renderList();
 
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
-import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+import {
+  getFirestore, collection, doc,
+  setDoc, deleteDoc, onSnapshot, query, orderBy
+} from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyAAw0OiKFAvPRG0HD5Jb78uBH2fgbPG0_k",
@@ -2811,54 +2816,77 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const firestore = getFirestore(app);
 
-// Expose db and helpers to global scope
-window.db = firestore;
-window._fsSetDoc = setDoc;
-window._fsDeleteDoc = deleteDoc;
-window._fsDoc = doc;
-window._fsCollection = collection;
+// ── Loading indicator
+document.getElementById('wineGrid').innerHTML =
+  '<div class="empty"><p>불러오는 중…</p></div>';
 
-// Show loading state
-document.getElementById('wineGrid').innerHTML = '<div class="empty"><p>불러오는 중…</p></div>';
+// ── Realtime listener: full collection sync
+// orderBy 없이 가져와서 클라이언트에서 정렬 — _createdAt 없는 문서도 안전하게 처리
+const colRef = collection(firestore, 'wines');
+onSnapshot(colRef, (snapshot) => {
+  // Rebuild wines array from Firestore snapshot
+  const incoming = [];
+  snapshot.forEach(d => incoming.push(d.data()));
 
-// Realtime listener — syncs wines array and re-renders
-const q = query(collection(firestore, 'wines'), orderBy('_createdAt', 'desc'));
-window._unsubscribe = onSnapshot(q, (snapshot) => {
-  wines = [];
-  snapshot.forEach(d => wines.push(d.data()));
-  // sort by createdAt desc for consistent order
-  wines.sort((a,b) => (b._createdAt||0) - (a._createdAt||0));
-  nextId = wines.length ? Math.max(...wines.map(w => w.id||0)) + 1 : 1;
+  // Sort: _createdAt 있으면 그 순서, 없으면 id 순
+  incoming.sort((a, b) => {
+    const tA = a._createdAt || a.id || 0;
+    const tB = b._createdAt || b.id || 0;
+    return tB - tA;
+  });
 
-  // If first load and no data, seed with sample
+  wines = incoming;
+  nextId = Date.now(); // always unique, not used for new wines (timestamp used instead)
+
+  // First load with no data → seed sample
   if (wines.length === 0) {
-    const sample = SAMPLES[0];
-    sample._createdAt = Date.now();
+    const sample = { ...SAMPLES[0], _createdAt: Date.now() };
     setDoc(doc(firestore, 'wines', String(sample.id)), sample);
-    return; // onSnapshot will fire again with the seeded data
+    return;
   }
 
   renderList();
-  // If detail page is open, refresh it
-  if (document.getElementById('detailPage').style.display !== 'none' && currentDetailId) {
+  updateCountryFilters();
+
+  // Refresh detail page if open
+  if (
+    document.getElementById('detailPage').style.display !== 'none' &&
+    currentDetailId
+  ) {
     const w = wines.find(x => x.id === currentDetailId);
-    if (w) openDetail(w.id);
+    if (w) {
+      // Only refresh metadata cells, don't re-open (would reset note edit state)
+      document.getElementById('d-price').textContent = displayPrice(w.price);
+      document.getElementById('d-store').textContent = w.store || '—';
+    }
   }
 }, (error) => {
   console.error('Firestore error:', error);
-  document.getElementById('wineGrid').innerHTML = '<div class="empty"><p>연결 오류가 발생했습니다</p><small>' + error.message + '</small></div>';
+  document.getElementById('wineGrid').innerHTML =
+    '<div class="empty"><p>연결 오류</p><small>' + error.message + '</small></div>';
 });
 
-// Override saveWineToDb and deleteWineFromDb to use imported functions
+// ── Save / Delete (exposed globally so non-module code can call them)
 window.saveWineToDb = async function(wine) {
   if (!wine._createdAt) wine._createdAt = Date.now();
-  await setDoc(doc(firestore, 'wines', String(wine.id)), wine);
+  try {
+    await setDoc(doc(firestore, 'wines', String(wine.id || wine._createdAt || Date.now())), wine);
+  } catch(e) {
+    console.error('saveWineToDb error:', e);
+  }
 };
 
 window.deleteWineFromDb = async function(id) {
-  await deleteDoc(doc(firestore, 'wines', String(id)));
+  try {
+    await deleteDoc(doc(firestore, 'wines', String(id)));
+  } catch(e) {
+    console.error('deleteWineFromDb error:', e);
+  }
 };
 
+function updateCountryFilters() {
+  if (typeof renderCountryFilters === 'function') renderCountryFilters();
+}
 </script>
 </body>
 </html>
